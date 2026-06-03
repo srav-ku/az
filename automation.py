@@ -82,20 +82,19 @@ def upload_to_vidara(server, video_path):
         response.raise_for_status()
         data = response.json()
         if "filecode" in data:
-            return True, data["filecode"], None
-        return False, None, f"Vidara missing filecode: {data}"
+            return True, None
+        return False, f"Vidara missing filecode: {data}"
     except Exception as e:
-        return False, None, str(e)
+        return False, str(e)
 
 def main():
     records = sheet.get_all_records()
-    all_rows = sheet.get_all_values()
     
-    # Calculate Max Number currently stored in column C
+    # Calculate Max Number currently stored in column C safely
     max_num = 0
     for r in records:
         try:
-            val = int(r.get("Number", 0))
+            val = int(r.get("Number", 0) or 0)
             if val > max_num:
                 max_num = val
         except ValueError:
@@ -107,43 +106,36 @@ def main():
         print("Could not acquire active Vidara upload target.")
         return
 
-    # Loop through rows to find the first unprocessed item
-    # row index in gspread is 1-based, and row 1 is headers, so start at index 2
+    # Process rows sequentially
     for idx, row in enumerate(records, start=2):
         status = str(row.get("Status", "")).strip().lower()
         title = str(row.get("Title", "")).strip()
         url = str(row.get("Link", "")).strip()
 
-        # Rules: Skip if it has 'success' or 'failed'
+        # Skip already completed rows (success or failed)
         if status in ["success", "failed"]:
             continue
         if not title or not url:
             continue
 
-        # Target found! Assign sequential numbering scheme
-        next_assign_num = max_num + 1
-        clean_name = sanitize_filename(title)
-        final_filename = f"{next_assign_num}. {clean_name}.mp4"
-        
-        print(f"\nProcessing Row {idx}: {final_filename}")
-        
-        # 1. Update Assigned Number & Status immediately to claim it
-        sheet.update_cell(idx, 3, next_assign_num) # Column C: Number
-        sheet.update_cell(idx, 5, "processing")   # Column E: Status
+        print(f"\n[+] Processing Row {idx}: {title}")
 
-        # 2. Scrape Target MP4 Links
+        # 1. Scrape Target MP4 Links
         mp4_urls, error_msg = get_mp4_links(session, url)
         video_count = len(mp4_urls)
-        sheet.update_cell(idx, 4, video_count)     # Column D: Count
 
         if error_msg or video_count == 0:
             err = error_msg if error_msg else "Zero video links found."
-            sheet.update_cell(idx, 5, "failed")
-            sheet.update_cell(idx, 6, err)
+            # FAILED: Update Status and Error only (Columns D, E, F)
+            sheet.update_cells(sheet.range(f'D{idx}:F{idx}'), [
+                gspread.Cell(idx, 4, video_count),
+                gspread.Cell(idx, 5, "failed"),
+                gspread.Cell(idx, 6, err)
+            ])
             continue
 
-        # 3. Download working fragments
-        temp_dir = f"./temp_{next_assign_num}"
+        # 2. Download working fragments
+        temp_dir = f"./temp_worker"
         os.makedirs(temp_dir, exist_ok=True)
         downloaded_clips = []
 
@@ -157,11 +149,15 @@ def main():
                             f.write(chunk)
                 downloaded_clips.append(temp_clip_path)
             except Exception as e:
-                print(f" Clip download error: {e}")
+                print(f" Clip {i} download error: {e}")
 
-        # 4. Compile with FFMPEG demuxer
-        final_output_file = f"./{final_filename}"
+        # 3. Only attempt merge if ALL clips downloaded successfully
         merge_success = False
+        next_assign_num = max_num + 1
+        clean_name = sanitize_filename(title)
+        final_filename = f"{next_assign_num}. {clean_name}.mp4"
+        final_output_file = f"./{final_filename}"
+        err_text = ""
 
         if len(downloaded_clips) == video_count:
             list_file_path = os.path.join(temp_dir, "file_list.txt")
@@ -177,31 +173,48 @@ def main():
         else:
             err_text = f"Downloaded clips count mismatch ({len(downloaded_clips)}/{video_count})"
 
-        # Clean raw parts directory
+        # Clean raw video chunks immediately to save local storage space
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
         if not merge_success:
-            sheet.update_cell(idx, 5, "failed")
-            sheet.update_cell(idx, 6, err_text)
+            # FAILED MERGE: Log it and move to next row
+            sheet.update_cells(sheet.range(f'D{idx}:F{idx}'), [
+                gspread.Cell(idx, 4, video_count),
+                gspread.Cell(idx, 5, "failed"),
+                gspread.Cell(idx, 6, err_text)
+            ])
             if os.path.exists(final_output_file):
                 os.remove(final_output_file)
             continue
 
-        # 5. Handshake Cloud Delivery System
-        up_ok, filecode, up_err = upload_to_vidara(upload_server, final_output_file)
+        # 4. Upload to Vidara
+        up_ok, up_err = upload_to_vidara(upload_server, final_output_file)
         
+        # IMMEDIATELY delete the merged file right after upload loop ends
         if os.path.exists(final_output_file):
             os.remove(final_output_file)
 
+        # 5. ONE SINGLE BATCH WRITE CALL TO GOOGLE SHEETS
         if up_ok:
-            sheet.update_cell(idx, 5, "success")
-            sheet.update_cell(idx, 6, filecode) # Stores Vidara URL reference inside Error column for logging
-            print(f"Successfully finished row {idx} -> assigned ID {next_assign_num}")
-            max_num = next_assign_num # Step up index tracking
+            # SUCCESS: Write Number, Count, Status. Error Column is left completely blank ("").
+            cell_list = sheet.range(f'C{idx}:F{idx}')
+            cell_list[0].value = next_assign_num  # Column C: Number
+            cell_list[1].value = video_count      # Column D: Count
+            cell_list[2].value = "success"        # Column E: Status
+            cell_list[3].value = ""               # Column F: Error (Kept Blank)
+            sheet.update_cells(cell_list)
+            
+            print(f"[✓] Row {idx} Complete -> Assigned Number: {next_assign_num}")
+            max_num = next_assign_num  # Increment max number tracking
         else:
-            sheet.update_cell(idx, 5, "failed")
-            sheet.update_cell(idx, 6, f"Upload error: {up_err}")
+            # FAILED UPLOAD: Do not assign a number
+            sheet.update_cells(sheet.range(f'D{idx}:F{idx}'), [
+                gspread.Cell(idx, 4, video_count),
+                gspread.Cell(idx, 5, "failed"),
+                gspread.Cell(idx, 6, f"Upload error: {up_err}")
+            ])
+            print(f"[!] Row {idx} Upload Failed")
 
 if __name__ == "__main__":
     main()
