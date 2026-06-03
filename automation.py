@@ -38,22 +38,42 @@ def get_vidara_server():
     return None
 
 def get_mp4_links(session, actress_url):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    # Enhanced desktop headers to bypass datacenter firewall checks
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive"
+    }
     try:
-        response = session.get(actress_url, headers=headers, timeout=15)
+        response = session.get(actress_url, headers=headers, timeout=20)
+        if response.status_code == 403 or "cloudflare" in response.text.lower():
+            return [], "Blocked by firewall (403 Forbidden / Cloudflare Protection)"
+        response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
     except Exception as e:
-        return [], f"Main page error: {str(e)}"
+        return [], f"Main page network error: {str(e)}"
 
     video_pages = []
-    for container in soup.select("div.single-page_content-container"):
-        if not container.select_one("div.single-page-title-wrapper"):
-            continue
-        for a in container.select("div.media-list-item.video-list-item > a[href]"):
+    # Scrapes links mapping standard media item boxes directly
+    for container in soup.select("div.single-page_content-container, div.cl-content"):
+        for a in container.select("div.media-list-item.video-list-item > a[href], a[href*='/video/']"):
             path = a["href"]
             if not path.startswith("http"):
                 path = "https://www.aznude.com" + path
-            video_pages.append(path)
+            if path not in video_pages:
+                video_pages.append(path)
+
+    # Fallback absolute link extraction if layout container wrapper styles change
+    if not video_pages:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "/view/video/" in href or "aznude.com/view/video/" in href:
+                if not href.startswith("http"):
+                    href = "https://www.aznude.com" + href
+                if href not in video_pages:
+                    video_pages.append(href)
 
     mp4_links = []
     for video_page in video_pages:
@@ -62,11 +82,12 @@ def get_mp4_links(session, actress_url):
             page_soup = BeautifulSoup(html, "html.parser")
             for a in page_soup.select("a[href]"):
                 href = a.get("href", "")
-                if href.endswith(".mp4"):
+                if href.endswith(".mp4") or ".mp4?" in href:
                     mp4_links.append(href)
                     break
         except Exception:
             continue
+            
     return list(set(mp4_links)), None
 
 def upload_to_vidara(server, video_path):
@@ -90,7 +111,6 @@ def upload_to_vidara(server, video_path):
 def main():
     records = sheet.get_all_records()
     
-    # Calculate Max Number currently stored in column C safely
     max_num = 0
     for r in records:
         try:
@@ -106,13 +126,11 @@ def main():
         print("Could not acquire active Vidara upload target.")
         return
 
-    # Process rows sequentially
     for idx, row in enumerate(records, start=2):
         status = str(row.get("Status", "")).strip().lower()
         title = str(row.get("Title", "")).strip()
         url = str(row.get("Link", "")).strip()
 
-        # Skip already completed rows (success or failed)
         if status in ["success", "failed"]:
             continue
         if not title or not url:
@@ -125,9 +143,9 @@ def main():
         video_count = len(mp4_urls)
 
         if error_msg or video_count == 0:
-            err = error_msg if error_msg else "Zero video links found."
-            # FAILED: Update Columns D, E, F cleanly using simple nested lists (no raw Cell objects)
+            err = error_msg if error_msg else "Zero video links found (No items found in selectors)."
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err]])
+            print(f"[-] Skipped row {idx} due to extraction failure: {err}")
             continue
 
         # 2. Download working fragments
@@ -138,7 +156,9 @@ def main():
         for i, mp4_url in enumerate(mp4_urls, start=1):
             temp_clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
             try:
-                with session.get(mp4_url, stream=True, timeout=30) as r:
+                # Use browser context headers for individual stream lookups too
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                with session.get(mp4_url, headers=headers, stream=True, timeout=30) as r:
                     r.raise_for_status()
                     with open(temp_clip_path, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=16384):
@@ -169,12 +189,10 @@ def main():
         else:
             err_text = f"Downloaded clips count mismatch ({len(downloaded_clips)}/{video_count})"
 
-        # Clean raw video chunks immediately to save local storage space
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
         if not merge_success:
-            # FAILED MERGE: Log it and move to next row
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err_text]])
             if os.path.exists(final_output_file):
                 os.remove(final_output_file)
@@ -183,18 +201,15 @@ def main():
         # 4. Upload to Vidara
         up_ok, up_err = upload_to_vidara(upload_server, final_output_file)
         
-        # IMMEDIATELY delete the merged file right after upload loop ends
         if os.path.exists(final_output_file):
             os.remove(final_output_file)
 
-        # 5. ONE SINGLE BATCH WRITE CALL TO GOOGLE SHEETS
+        # 5. Save final results to Google Sheet
         if up_ok:
-            # SUCCESS: Write Number (C), Count (D), Status (E), Error kept blank (F)
             sheet.update(range_name=f'C{idx}:F{idx}', values=[[next_assign_num, video_count, "success", ""]])
             print(f"[✓] Row {idx} Complete -> Assigned Number: {next_assign_num}")
-            max_num = next_assign_num  # Increment max number tracking
+            max_num = next_assign_num
         else:
-            # FAILED UPLOAD: Do not assign a number
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", f"Upload error: {up_err}"]])
             print(f"[!] Row {idx} Upload Failed")
 
