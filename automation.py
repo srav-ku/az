@@ -3,9 +3,9 @@ import re
 import shutil
 import json
 import requests
-from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
+from playwright.sync_api import sync_playwright
 
 # ==================== CONFIGURATION ====================
 VIDARA_API_KEY = os.getenv("VIDARA_API_KEY")
@@ -37,57 +37,52 @@ def get_vidara_server():
         print(f"Failed to fetch Vidara Server: {e}")
     return None
 
-def get_mp4_links(session, actress_url):
-    # Enhanced desktop headers to bypass datacenter firewall checks
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/",
-        "Connection": "keep-alive"
-    }
-    try:
-        response = session.get(actress_url, headers=headers, timeout=20)
-        if response.status_code == 403 or "cloudflare" in response.text.lower():
-            return [], "Blocked by firewall (403 Forbidden / Cloudflare Protection)"
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-    except Exception as e:
-        return [], f"Main page network error: {str(e)}"
-
+def scrape_links_with_playwright(actress_url):
+    """Launches a real headless browser instance to bypass Cloudflare/WAF checks."""
     video_pages = []
-    # Scrapes links mapping standard media item boxes directly
-    for container in soup.select("div.single-page_content-container, div.cl-content"):
-        for a in container.select("div.media-list-item.video-list-item > a[href], a[href*='/video/']"):
-            path = a["href"]
-            if not path.startswith("http"):
-                path = "https://www.aznude.com" + path
-            if path not in video_pages:
-                video_pages.append(path)
-
-    # Fallback absolute link extraction if layout container wrapper styles change
-    if not video_pages:
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/view/video/" in href or "aznude.com/view/video/" in href:
-                if not href.startswith("http"):
-                    href = "https://www.aznude.com" + href
-                if href not in video_pages:
-                    video_pages.append(href)
-
     mp4_links = []
-    for video_page in video_pages:
+    
+    with sync_playwright() as p:
+        # Emulate a real desktop Chrome device profile context
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720}
+        )
+        page = context.new_page()
+        
         try:
-            html = session.get(video_page, headers=headers, timeout=15).text
-            page_soup = BeautifulSoup(html, "html.parser")
-            for a in page_soup.select("a[href]"):
-                href = a.get("href", "")
-                if href.endswith(".mp4") or ".mp4?" in href:
-                    mp4_links.append(href)
-                    break
-        except Exception:
-            continue
+            print(f"  [-] Navigating browser to hub target...")
+            page.goto(actress_url, wait_until="domcontentloaded", timeout=30000)
             
+            # Extract video viewer page links via anchor evaluations
+            hrefs = page.locator("a[href]").evaluate_all("elements => elements.map(e => e.getAttribute('href'))")
+            for href in hrefs:
+                if "/view/video/" in href or "video-list-item" in href:
+                    full_path = href if href.startswith("http") else f"https://www.aznude.com{href}"
+                    if full_path not in video_pages:
+                        video_pages.append(full_path)
+                        
+            print(f"  [-] Identified {len(video_pages)} standalone media viewers. Extracting raw stream points...")
+            
+            # Crawl out direct media locations
+            for video_page in video_pages:
+                try:
+                    page.goto(video_page, wait_until="domcontentloaded", timeout=20000)
+                    stream_hrefs = page.locator("a[href]").evaluate_all("elements => elements.map(e => e.getAttribute('href'))")
+                    for s_href in stream_hrefs:
+                        if s_href and (".mp4" in s_href or s_href.split('?')[0].endswith('.mp4')):
+                            mp4_links.append(s_href)
+                            break # Found primary media chunk for this panel page
+                except Exception:
+                    continue
+                    
+        except Exception as e:
+            browser.close()
+            return [], f"Headless browser failure: {str(e)}"
+            
+        browser.close()
+        
     return list(set(mp4_links)), None
 
 def upload_to_vidara(server, video_path):
@@ -120,11 +115,13 @@ def main():
         except ValueError:
             continue
 
-    session = requests.Session()
     upload_server = get_vidara_server()
     if not upload_server:
         print("Could not acquire active Vidara upload target.")
         return
+
+    # Use a standard network session for downloading binary files
+    session = requests.Session()
 
     for idx, row in enumerate(records, start=2):
         status = str(row.get("Status", "")).strip().lower()
@@ -138,25 +135,25 @@ def main():
 
         print(f"\n[+] Processing Row {idx}: {title}")
 
-        # 1. Scrape Target MP4 Links
-        mp4_urls, error_msg = get_mp4_links(session, url)
+        # 1. Scrape via Headless Browser Strategy
+        mp4_urls, error_msg = scrape_links_with_playwright(url)
         video_count = len(mp4_urls)
 
         if error_msg or video_count == 0:
-            err = error_msg if error_msg else "Zero video links found (No items found in selectors)."
+            err = error_msg if error_msg else "Zero video links found (Firewall blocked or empty selectors)."
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err]])
-            print(f"[-] Skipped row {idx} due to extraction failure: {err}")
+            print(f"[-] Skipped row {idx}: {err}")
             continue
 
-        # 2. Download working fragments
+        # 2. Download fragments locally
         temp_dir = f"./temp_worker"
         os.makedirs(temp_dir, exist_ok=True)
         downloaded_clips = []
 
+        print(f"  [-] Extracting direct stream resources...")
         for i, mp4_url in enumerate(mp4_urls, start=1):
             temp_clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
             try:
-                # Use browser context headers for individual stream lookups too
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
                 with session.get(mp4_url, headers=headers, stream=True, timeout=30) as r:
                     r.raise_for_status()
@@ -165,9 +162,9 @@ def main():
                             f.write(chunk)
                 downloaded_clips.append(temp_clip_path)
             except Exception as e:
-                print(f" Clip {i} download error: {e}")
+                print(f"   [!] Clip {i} download error: {e}")
 
-        # 3. Only attempt merge if ALL clips downloaded successfully
+        # 3. Compile Lossless Output Container via FFmpeg
         merge_success = False
         next_assign_num = max_num + 1
         clean_name = sanitize_filename(title)
@@ -198,13 +195,14 @@ def main():
                 os.remove(final_output_file)
             continue
 
-        # 4. Upload to Vidara
+        # 4. Process Cloud Handoff to Vidara
+        print(f"  [^] Initializing stream uploading payload...")
         up_ok, up_err = upload_to_vidara(upload_server, final_output_file)
         
         if os.path.exists(final_output_file):
             os.remove(final_output_file)
 
-        # 5. Save final results to Google Sheet
+        # 5. One single batch update write call back to Google Sheet
         if up_ok:
             sheet.update(range_name=f'C{idx}:F{idx}', values=[[next_assign_num, video_count, "success", ""]])
             print(f"[✓] Row {idx} Complete -> Assigned Number: {next_assign_num}")
