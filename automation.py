@@ -126,12 +126,8 @@ def main():
 
         if error_msg or video_count == 0:
             err = error_msg if error_msg else "Zero video links found."
-            # FAILED: Update Status and Error only (Columns D, E, F)
-            sheet.update_cells(sheet.range(f'D{idx}:F{idx}'), [
-                gspread.Cell(idx, 4, video_count),
-                gspread.Cell(idx, 5, "failed"),
-                gspread.Cell(idx, 6, err)
-            ])
+            # FAILED: Update Columns D, E, F cleanly using simple nested lists (no raw Cell objects)
+            sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err]])
             continue
 
         # 2. Download working fragments
@@ -179,11 +175,7 @@ def main():
 
         if not merge_success:
             # FAILED MERGE: Log it and move to next row
-            sheet.update_cells(sheet.range(f'D{idx}:F{idx}'), [
-                gspread.Cell(idx, 4, video_count),
-                gspread.Cell(idx, 5, "failed"),
-                gspread.Cell(idx, 6, err_text)
-            ])
+            sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err_text]])
             if os.path.exists(final_output_file):
                 os.remove(final_output_file)
             continue
@@ -197,23 +189,13 @@ def main():
 
         # 5. ONE SINGLE BATCH WRITE CALL TO GOOGLE SHEETS
         if up_ok:
-            # SUCCESS: Write Number, Count, Status. Error Column is left completely blank ("").
-            cell_list = sheet.range(f'C{idx}:F{idx}')
-            cell_list[0].value = next_assign_num  # Column C: Number
-            cell_list[1].value = video_count      # Column D: Count
-            cell_list[2].value = "success"        # Column E: Status
-            cell_list[3].value = ""               # Column F: Error (Kept Blank)
-            sheet.update_cells(cell_list)
-            
+            # SUCCESS: Write Number (C), Count (D), Status (E), Error kept blank (F)
+            sheet.update(range_name=f'C{idx}:F{idx}', values=[[next_assign_num, video_count, "success", ""]])
             print(f"[✓] Row {idx} Complete -> Assigned Number: {next_assign_num}")
             max_num = next_assign_num  # Increment max number tracking
         else:
             # FAILED UPLOAD: Do not assign a number
-            sheet.update_cells(sheet.range(f'D{idx}:F{idx}'), [
-                gspread.Cell(idx, 4, video_count),
-                gspread.Cell(idx, 5, "failed"),
-                gspread.Cell(idx, 6, f"Upload error: {up_err}")
-            ])
+            sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", f"Upload error: {up_err}"]])
             print(f"[!] Row {idx} Upload Failed")
 
 if __name__ == "__main__":
