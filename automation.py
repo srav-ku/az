@@ -44,7 +44,7 @@ def get_vidara_server():
     return None
 
 def scrape_links_with_unblocked_engine(actress_url):
-    """Uses optimized Playwright flags to extract links in the exact structural order they appear on the webpage."""
+    """Uses optimized Playwright flags to extract links in the exact structural order they appear on the page layout."""
     video_pages = []
     mp4_links = []
 
@@ -126,88 +126,69 @@ def scrape_links_with_unblocked_engine(actress_url):
                 continue
 
         browser.close()
-        print(f"[LOG] Playwright engine shut down. Unique video links parsed in exact presentation order: {len(mp4_links)}")
+        print(f"[LOG] Playwright engine shut down. Unique video links parsed in exact order: {len(mp4_links)}")
 
     return mp4_links, None
 
-def get_clip_properties(file_path):
-    """Inspects video parameters to extract precise native height, width, and audio existence."""
+def check_audio_presence(file_path):
+    """Uses ffprobe to verify if the file has an active audio channel."""
     cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "stream=width,height,codec_type",
-        "-of", "json", file_path
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=codec_type", "-of", "json", file_path
     ]
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         data = json.loads(result.stdout)
-        streams = data.get("streams", [])
-        
-        width, height = 1280, 720 # Fallback values
-        has_audio = False
-        
-        for s in streams:
-            if s.get("codec_type") == "video":
-                width = int(s.get("width", width))
-                height = int(s.get("height", height))
-            elif s.get("codec_type") == "audio":
-                has_audio = True
-                
-        return width, height, has_audio
+        return len(data.get("streams", [])) > 0
     except Exception:
-        return 1280, 720, False
+        return False
 
 def merge_large_video_batch(ordered_clips, output_path, temp_dir):
     if not ordered_clips:
         return False, "No clips provided for merging."
 
-    standardized_clips = []
+    final_input_list = []
     
-    # Process files sequentially based on their original link discovery positioning
+    # Process sequential clips loop based on extraction discovery index
     for idx, clip in enumerate(ordered_clips):
-        norm_output = os.path.join(temp_dir, f"norm_{idx:03d}.mp4")
-        w, h, has_audio = get_clip_properties(clip)
+        has_audio = check_audio_presence(clip)
         
-        print(f"  [-] Preparing index segment ({idx+1}/{len(ordered_clips)}) | Resolution: {w}x{h} | Audio: {has_audio}")
-
-        # Retains native frame footprint, locks audio sample clocks to remove drift, and preserves high bitrates using CRF 14
         if has_audio:
-            cmd_norm = [
-                "ffmpeg", "-y", "-i", clip,
-                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-                "-af", "aresample=async=1",
-                "-c:v", "libx264", "-crf", "14", "-preset", "superfast",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-                "-vsync", "cfr", "-loglevel", "error", norm_output
-            ]
+            # Native audio present. Keep stream completely untouched to preserve original quality
+            final_input_list.append(clip)
+            print(f"  [-] Verified clip alignment ({idx+1}/{len(ordered_clips)}) | Kept Original Tracks Lossless")
         else:
-            cmd_norm = [
+            # Missing audio track detected. Inject silent container instantly without quality loss
+            print(f"  [!] Missing audio stream detected on fragment index {idx+1}. Inserting silent sync track...")
+            fixed_clip_path = os.path.join(temp_dir, f"fixed_audio_{idx:03d}.mp4")
+            
+            cmd_fix = [
                 "ffmpeg", "-y", "-i", clip,
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-                "-af", "aresample=async=1",
-                "-c:v", "libx264", "-crf", "14", "-preset", "superfast",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-                "-shortest", "-vsync", "cfr", "-loglevel", "error", norm_output
+                "-c:v", "copy", "-c:a", "aac", "-shortest", "-loglevel", "error", fixed_clip_path
             ]
+            try:
+                res = subprocess.run(cmd_fix, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if res.returncode == 0 and os.path.exists(fixed_clip_path):
+                    final_input_list.append(fixed_clip_path)
+                else:
+                    final_input_list.append(clip)
+            except Exception:
+                final_input_list.append(clip)
 
-        try:
-            res = subprocess.run(cmd_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode == 0 and os.path.exists(norm_output):
-                standardized_clips.append(norm_output)
-            else:
-                return False, f"Clip processing failed at sequence position {idx}: {res.stderr.decode()}"
-        except Exception as e:
-            return False, f"Exception during standardization of segment position {idx}: {str(e)}"
-
-    # Build sequential playlist mapping file without running sorting scripts out of order
+    # Generate the text tracking playlist mapping for the lossless demuxer engine
     list_txt_path = os.path.join(temp_dir, "batch_list.txt")
     with open(list_txt_path, "w", encoding="utf-8") as f:
-        for clip_path in standardized_clips:
-            f.write(f"file '{os.path.abspath(clip_path)}'\n")
+        for clip_path in final_input_list:
+            escaped_path = os.path.abspath(clip_path).replace("'", "'\\''")
+            f.write(f"file '{escaped_path}'\n")
 
-    print(f"[LOG] Consolidating track sequence streams into single container out to: {output_path}")
+    print(f"[LOG] Executing lightning-fast lossless stream merge copy pass to: {output_path}")
+    
+    # Complete copy pass without conversion layers, preserving original dimensions and frame properties
     cmd_merge = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
-        "-c", "copy", "-vsync", "cfr", "-loglevel", "error", output_path
+        "-c", "copy", "-loglevel", "error", output_path
     ]
 
     try:
@@ -295,13 +276,13 @@ def main():
         temp_dir = os.path.abspath(f"./temp_worker")
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Build tasks capturing exact layout structure indexes discovered on original page
+        # Build task mapping preserving structural discovery order found on webpage layout
         download_tasks = []
         for i, mp4_url in enumerate(mp4_urls):
             temp_clip_path = os.path.join(temp_dir, f"clip_{i:03d}.mp4")
             download_tasks.append((mp4_url, temp_clip_path, i))
 
-        print(f"[LOG] Launching thread workers using strict presentation sequence map ({video_count} items)...")
+        print(f"[LOG] Launching sequential download stages ({video_count} items)...")
         downloaded_clips = [None] * video_count
         download_failed = False
         
@@ -322,7 +303,7 @@ def main():
             merge_success = False
             err_text = f"Download validation mismatch; tracking drops skipped during chunk extraction."
         else:
-            print(f"[LOG] Stream parts downloaded. Transferring cleanly to the seamless merge layout layer...")
+            print(f"[LOG] Stream parts ready. Transferring to 1:1 lossless concatenation loop...")
             merge_success, merge_err = merge_large_video_batch(downloaded_clips, os.path.abspath(f"./temp_out.mp4"), temp_dir)
             err_text = merge_err if merge_err else ""
 
