@@ -50,7 +50,6 @@ def scrape_links_with_unblocked_engine(actress_url):
 
     print(f"[LOG] Launching Playwright engine...")
     with sync_playwright() as p:
-        # Crucial flags added here to prevent GitHub Actions from freezing
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -70,7 +69,6 @@ def scrape_links_with_unblocked_engine(actress_url):
 
         try:
             print(f"[LOG] Requesting URL via browser context: {actress_url}")
-            # Changed wait_until to 'commit' so it doesn't get stuck waiting on lazy ads/trackers
             page.goto(actress_url, wait_until="commit", timeout=45000)
             print("[LOG] Page reached. Sleeping briefly to let DOM stabilize...")
             page.wait_for_timeout(3000)
@@ -132,74 +130,49 @@ def scrape_links_with_unblocked_engine(actress_url):
 
     return list(set(mp4_links)), None
 
-def get_max_batch_dimensions(clips_list):
-    max_w = 1280
-    max_h = 720
-    max_area = max_w * max_h
-
-    for clip in clips_list:
-        cmd = [
-            "ffprobe", "-v", "error", "-select_streams", "v:0",
-            "-show_entries", "stream=width,height", "-of", "json", clip
-        ]
-        try:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            data = json.loads(result.stdout)
-            w = int(data['streams'][0]['width'])
-            h = int(data['streams'][0]['height'])
-            if (w * h) > max_area:
-                max_area = w * h
-                max_w = w
-                max_h = h
-        except Exception:
-            continue
-    return max_w, max_h
-
-def merge_large_video_batch(clips_list, output_path, temp_dir):
+def normal_merge_clips(clips_list, output_path):
+    """
+    Combines mixed videos cleanly via an on-the-fly matrix. Low-res and vertical clips 
+    are placed inside a unified canvas naturally without distortion or losing quality.
+    """
     if not clips_list:
         return False, "No clips provided for merging."
 
-    target_w, target_h = get_max_batch_dimensions(clips_list)
-    print(f"[LOG] Master Target Aspect Footprint Selected: {target_w}x{target_h}")
-
-    standardized_clips = []
+    print(f"[LOG] Building dynamic canvas matrix for {len(clips_list)} mixed clips...")
     
-    for idx, clip in enumerate(clips_list):
-        norm_output = os.path.join(temp_dir, f"norm_{idx}.mp4")
-        print(f"  [-] Normalizing index chunk layout ({idx+1}/{len(clips_list)}) -> {os.path.basename(clip)}")
-        cmd_norm = [
-            "ffmpeg", "-y", "-i", clip,
-            "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-            "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",
-            "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-            "-loglevel", "error", norm_output
-        ]
-        try:
-            res = subprocess.run(cmd_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if res.returncode == 0 and os.path.exists(norm_output):
-                standardized_clips.append(norm_output)
-            else:
-                return False, f"Clip standardization failed at index {idx}"
-        except Exception as e:
-            return False, f"Exception during standardization of clip {idx}: {str(e)}"
+    cmd = ["ffmpeg", "-y"]
+    for clip in clips_list:
+        cmd.extend(["-i", clip])
 
-    list_txt_path = os.path.join(temp_dir, "batch_list.txt")
-    with open(list_txt_path, "w", encoding="utf-8") as f:
-        for clip_path in standardized_clips:
-            f.write(f"file '{os.path.abspath(clip_path)}'\n")
-
-    print(f"[LOG] Executing final structural demux stitching matrix output to: {output_path}")
-    cmd_merge = [
-        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
-        "-c:v", "libx264", "-preset", "faster", "-crf", "16", 
-        "-c:a", "copy", "-loglevel", "error", output_path
-    ]
+    filter_complex = ""
+    # 1. Take each clip and safely position it into a standard 1280x720 box
+    for idx in range(len(clips_list)):
+        filter_complex += (
+            f"[{idx}:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[v{idx}];"
+        )
+    
+    # 2. Line up the prepared video and audio channels back-to-back
+    for idx in range(len(clips_list)):
+        filter_complex += f"[v{idx}][{idx}:a]"
+        
+    filter_complex += f"concat=n={len(clips_list)}:v=1:a=1[v][a]"
+    
+    # 3. Export using CRF 16 (Visually Lossless Quality Control)
+    cmd.extend([
+        "-filter_complex", filter_complex,
+        "-map", "[v]", "-map", "[a]",
+        "-c:v", "libx264", "-preset", "faster", "-crf", "16",
+        "-c:a", "aac", "-b:a", "192k",
+        "-loglevel", "error", output_path
+    ])
 
     try:
-        result = subprocess.run(cmd_merge, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        print("[LOG] Stitching videos via high-fidelity rendering pipeline...")
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0 and os.path.exists(output_path):
             return True, None
-        return False, f"Stitching engine error: {result.stderr}"
+        return False, f"FFmpeg native engine stitching failed: {result.stderr}"
     except Exception as e:
         return False, str(e)
 
@@ -305,8 +278,7 @@ def main():
         final_output_file = os.path.abspath(f"./{final_filename}")
 
         if len(downloaded_clips) == video_count and video_count > 0:
-            print(f"[LOG] Initiating standardization and processing for file assembly...")
-            merge_success, merge_err = merge_large_video_batch(downloaded_clips, final_output_file, temp_dir)
+            merge_success, merge_err = normal_merge_clips(downloaded_clips, final_output_file)
             err_text = merge_err if merge_err else ""
         else:
             merge_success = False
