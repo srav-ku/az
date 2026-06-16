@@ -6,12 +6,14 @@ import subprocess
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
-from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==================== CONFIGURATION ====================
 VIDARA_API_KEY = os.getenv("VIDARA_API_KEY")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+MAX_DOWNLOAD_WORKERS = 5
 # =======================================================
 
 scopes = [
@@ -37,69 +39,55 @@ def get_vidara_server():
         print(f"Failed to fetch Vidara Server: {e}")
     return None
 
-def extract_all_links_from_page_and_frames(page):
-    found_hrefs = []
-    try:
-        main_hrefs = page.locator("a[href]").evaluate_all("elements => elements.map(e => e.getAttribute('href'))")
-        found_hrefs.extend(main_hrefs)
-        for frame in page.frames:
-            try:
-                frame_hrefs = frame.locator("a[href]").evaluate_all("elements => elements.map(e => e.getAttribute('href'))")
-                found_hrefs.extend(frame_hrefs)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return [h for h in found_hrefs if h]
-
-def scrape_links_with_playwright(actress_url):
+def scrape_links_with_bs4(actress_url):
+    """Gathers raw MP4 links using fast multi-threaded BeautifulSoup extraction."""
+    session = requests.Session()
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     video_pages = []
     mp4_links = []
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 720}
-        )
-        page = context.new_page()
-        
+
+    try:
+        response = session.get(actress_url, headers=headers, timeout=20)
+        soup = BeautifulSoup(response.text, "html.parser")
+    except Exception as e:
+        return [], f"Failed to load main hub page: {str(e)}"
+
+    for container in soup.select("div.single-page_content-container"):
+        if not container.select_one("div.single-page-title-wrapper"):
+            continue
+        for a in container.select("div.media-list-item.video-list-item > a[href]"):
+            path = a["href"]
+            if not path.startswith("http"):
+                path = "https://www.aznude.com" + path
+            if path not in video_pages:
+                video_pages.append(path)
+
+    if not video_pages:
+        return [], None
+
+    print(f"  [-] Identified {len(video_pages)} video subpages. Extracting direct streams...")
+
+    def scan_subpage(video_page):
         try:
-            print(f"  [-] Navigating browser to hub target...")
-            page.goto(actress_url, wait_until="networkidle", timeout=40000)
-            page.wait_for_timeout(5000)
-            
-            all_hub_hrefs = extract_all_links_from_page_and_frames(page)
-            for href in all_hub_hrefs:
-                if "/view/video/" in href or "/video/" in href:
-                    full_path = href if href.startswith("http") else f"https://www.aznude.com{href}"
-                    if full_path not in video_pages:
-                        video_pages.append(full_path)
-                        
-            print(f"  [-] Identified {len(video_pages)} video pages. Extracting direct streams...")
-            
-            for video_page in video_pages:
-                try:
-                    page.goto(video_page, wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(2000)
-                    
-                    all_video_hrefs = extract_all_links_from_page_and_frames(page)
-                    for s_href in all_video_hrefs:
-                        if ".mp4" in s_href or s_href.split('?')[0].endswith('.mp4'):
-                            full_mp4 = s_href if s_href.startswith("http") else f"https://www.aznude.com{s_href}"
-                            if full_mp4 not in mp4_links:
-                                mp4_links.append(full_mp4)
-                                break
-                except Exception:
-                    continue
-                    
-        except Exception as e:
-            browser.close()
-            return [], f"Headless browser failure: {str(e)}"
-            
-        browser.close()
-        
-    return mp4_links, None
+            html = session.get(video_page, headers=headers, timeout=15).text
+            page_soup = BeautifulSoup(html, "html.parser")
+            for a in page_soup.select("a[href]"):
+                href = a.get("href", "")
+                if href.endswith(".mp4") or ".mp4?" in href:
+                    if not href.startswith("http"):
+                        href = "https://www.aznude.com" + href
+                    return href
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = executor.map(scan_subpage, video_pages)
+        for r in results:
+            if r:
+                mp4_links.append(r)
+
+    return list(set(mp4_links)), None
 
 def get_max_batch_dimensions(clips_list):
     """Scans all video files and detects the absolute highest resolution in the batch."""
@@ -129,7 +117,6 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
     if not clips_list:
         return False, "No clips provided for merging."
 
-    # Find the maximum possible resolution across ALL clips to protect quality
     target_w, target_h = get_max_batch_dimensions(clips_list)
     print(f"  [-] Highest Resolution Detected: {target_w}x{target_h}. Concat-processing safely...")
 
@@ -138,11 +125,10 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
     for idx, clip in enumerate(clips_list):
         norm_output = os.path.join(temp_dir, f"norm_{idx}.mp4")
         
-        # Uses Lanczos interpolation scaling for high-quality upscaling, forces 30fps and stereo audio mapping
         cmd_norm = [
             "ffmpeg", "-y", "-i", clip,
             "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-            "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",  # CRF 0 = Perfect intermediate digital duplicate
+            "-c:v", "libx264", "-crf", "0", "-preset", "ultrafast",
             "-c:a", "aac", "-b:a", "192k", "-ac", "2",
             "-loglevel", "error", norm_output
         ]
@@ -156,13 +142,11 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
         except Exception as e:
             return False, f"Exception during standardization of clip {idx}: {str(e)}"
 
-    # Stitch the matching files together without any playback lag or skipping issues
     list_txt_path = os.path.join(temp_dir, "batch_list.txt")
     with open(list_txt_path, "w", encoding="utf-8") as f:
         for clip_path in standardized_clips:
             f.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-    # CRF 16 delivers visually flawless quality results across any layout profile
     cmd_merge = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
         "-c:v", "libx264", "-preset", "faster", "-crf", "16", 
@@ -176,6 +160,18 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
         return False, f"Stitching process failed: {result.stderr}"
     except Exception as e:
         return False, str(e)
+
+def download_single_clip(url, target_path):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        with requests.get(url, stream=True, timeout=45, headers=headers) as r:
+            r.raise_for_status()
+            with open(target_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+        return True
+    except Exception:
+        return False
 
 def upload_to_vidara(server, video_path):
     filename = os.path.basename(video_path)
@@ -212,8 +208,6 @@ def main():
         print("Could not acquire active Vidara upload target.")
         return
 
-    session = requests.Session()
-
     for idx, row in enumerate(records, start=2):
         status = str(row.get("Status", "")).strip().lower()
         title = str(row.get("Title", "")).strip()
@@ -226,7 +220,8 @@ def main():
 
         print(f"\n[+] Processing Row {idx}: {title}")
 
-        mp4_urls, error_msg = scrape_links_with_playwright(url)
+        # Scrape using the explicit layout selections that work
+        mp4_urls, error_msg = scrape_links_with_bs4(url)
         video_count = len(mp4_urls)
 
         if error_msg or video_count == 0:
@@ -237,21 +232,27 @@ def main():
 
         temp_dir = os.path.abspath(f"./temp_worker")
         os.makedirs(temp_dir, exist_ok=True)
-        downloaded_clips = []
+        
+        # Build tasks list for thread pooling
+        download_tasks = []
+        for i, mp4_url in enumerate(sorted(mp4_urls), start=1):
+            temp_clip_path = os.path.join(temp_dir, f"clip_{i:03d}.mp4")
+            download_tasks.append((mp4_url, temp_clip_path))
 
-        print(f"  [-] Extracting {video_count} direct stream resources...")
-        for i, mp4_url in enumerate(mp4_urls, start=1):
-            temp_clip_path = os.path.join(temp_dir, f"clip_{i}.mp4")
-            try:
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-                with session.get(mp4_url, headers=headers, stream=True, timeout=45) as r:
-                    r.raise_for_status()
-                    with open(temp_clip_path, 'wb') as f:
-                        for chunk in r.iter_content(chunk_size=65536):
-                            f.write(chunk)
-                downloaded_clips.append(temp_clip_path)
-            except Exception as e:
-                print(f"   [!] Clip {i} download error: {e}")
+        print(f"  [-] Downloading {video_count} clips concurrently using thread pooling...")
+        downloaded_clips = []
+        
+        with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as download_executor:
+            futures = {download_executor.submit(download_single_clip, u, p): p for u, p in download_tasks}
+            for future in as_completed(futures):
+                clip_path = futures[future]
+                if future.result():
+                    downloaded_clips.append(clip_path)
+                else:
+                    print(f"   [!] Clip download failure for: {clip_path}")
+
+        # Sort clips to preserve visual ordering
+        downloaded_clips.sort()
 
         next_assign_num = max_num + 1
         clean_name = sanitize_filename(title)
