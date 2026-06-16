@@ -44,7 +44,7 @@ def get_vidara_server():
     return None
 
 def scrape_links_with_unblocked_engine(actress_url):
-    """Uses optimized Playwright flags to bypass cloud hangs and dumps navigation checkpoints."""
+    """Uses optimized Playwright flags to extract links in the exact structural order they appear on the webpage."""
     video_pages = []
     mp4_links = []
 
@@ -97,7 +97,7 @@ def scrape_links_with_unblocked_engine(actress_url):
             browser.close()
             return [], None
 
-        print(f"[LOG] Found {len(video_pages)} video subpages. Processing streams...")
+        print(f"[LOG] Found {len(video_pages)} video subpages. Processing streams in chronological order...")
 
         for idx, video_page in enumerate(video_pages, start=1):
             try:
@@ -126,56 +126,67 @@ def scrape_links_with_unblocked_engine(actress_url):
                 continue
 
         browser.close()
-        print(f"[LOG] Playwright engine shut down. Unique video links parsed: {len(mp4_links)}")
+        print(f"[LOG] Playwright engine shut down. Unique video links parsed in exact presentation order: {len(mp4_links)}")
 
-    return list(set(mp4_links)), None
+    return mp4_links, None
 
-def check_audio_presence(file_path):
-    """Uses ffprobe to verify if the file has an active audio channel."""
+def get_clip_properties(file_path):
+    """Inspects video parameters to extract precise native height, width, and audio existence."""
     cmd = [
-        "ffprobe", "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=codec_type", "-of", "json", file_path
+        "ffprobe", "-v", "error", "-show_entries", "stream=width,height,codec_type",
+        "-of", "json", file_path
     ]
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         data = json.loads(result.stdout)
-        return len(data.get("streams", [])) > 0
+        streams = data.get("streams", [])
+        
+        width, height = 1280, 720 # Fallback values
+        has_audio = False
+        
+        for s in streams:
+            if s.get("codec_type") == "video":
+                width = int(s.get("width", width))
+                height = int(s.get("height", height))
+            elif s.get("codec_type") == "audio":
+                has_audio = True
+                
+        return width, height, has_audio
     except Exception:
-        return False
+        return 1280, 720, False
 
-def merge_large_video_batch(clips_list, output_path, temp_dir):
-    if not clips_list:
+def merge_large_video_batch(ordered_clips, output_path, temp_dir):
+    if not ordered_clips:
         return False, "No clips provided for merging."
-
-    # Forces an optimized standard widescreen aspect ratio to avoid shrinking bugs
-    target_w, target_h = 1280, 720
-    print(f"[LOG] Target Frame Dimensions Configured: {target_w}x{target_h}")
 
     standardized_clips = []
     
-    for idx, clip in enumerate(clips_list):
-        norm_output = os.path.join(temp_dir, f"norm_{idx}.mp4")
-        has_audio = check_audio_presence(clip)
-        print(f"  [-] Standardizing video/audio layout ({idx+1}/{len(clips_list)}) | Has Audio: {has_audio}")
+    # Process files sequentially based on their original link discovery positioning
+    for idx, clip in enumerate(ordered_clips):
+        norm_output = os.path.join(temp_dir, f"norm_{idx:03d}.mp4")
+        w, h, has_audio = get_clip_properties(clip)
+        
+        print(f"  [-] Preparing index segment ({idx+1}/{len(ordered_clips)}) | Resolution: {w}x{h} | Audio: {has_audio}")
 
+        # Retains native frame footprint, locks audio sample clocks to remove drift, and preserves high bitrates using CRF 14
         if has_audio:
-            # Clip already contains native audio; match video size to canvas safely
             cmd_norm = [
                 "ffmpeg", "-y", "-i", clip,
-                "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-                "-c:v", "libx264", "-crf", "16", "-preset", "ultrafast",
-                "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-                "-loglevel", "error", norm_output
+                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
+                "-af", "aresample=async=1",
+                "-c:v", "libx264", "-crf", "14", "-preset", "superfast",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
+                "-vsync", "cfr", "-loglevel", "error", norm_output
             ]
         else:
-            # Clip is silent; synthesize a matching dummy silent audio stream track so stitching doesn't break
             cmd_norm = [
                 "ffmpeg", "-y", "-i", clip,
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-                "-c:v", "libx264", "-crf", "16", "-preset", "ultrafast",
-                "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-shortest",
-                "-loglevel", "error", norm_output
+                "-vf", f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
+                "-af", "aresample=async=1",
+                "-c:v", "libx264", "-crf", "14", "-preset", "superfast",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
+                "-shortest", "-vsync", "cfr", "-loglevel", "error", norm_output
             ]
 
         try:
@@ -183,20 +194,20 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
             if res.returncode == 0 and os.path.exists(norm_output):
                 standardized_clips.append(norm_output)
             else:
-                return False, f"Clip processing failed at index {idx} with error: {res.stderr.decode()}"
+                return False, f"Clip processing failed at sequence position {idx}: {res.stderr.decode()}"
         except Exception as e:
-            return False, f"Exception during normalization of clip {idx}: {str(e)}"
+            return False, f"Exception during standardization of segment position {idx}: {str(e)}"
 
-    # Generate the text index file mapping for the demuxer pipeline
+    # Build sequential playlist mapping file without running sorting scripts out of order
     list_txt_path = os.path.join(temp_dir, "batch_list.txt")
     with open(list_txt_path, "w", encoding="utf-8") as f:
         for clip_path in standardized_clips:
             f.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-    print(f"[LOG] Merging clean tracks into final destination file: {output_path}")
+    print(f"[LOG] Consolidating track sequence streams into single container out to: {output_path}")
     cmd_merge = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
-        "-c", "copy", "-loglevel", "error", output_path
+        "-c", "copy", "-vsync", "cfr", "-loglevel", "error", output_path
     ]
 
     try:
@@ -207,7 +218,8 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
     except Exception as e:
         return False, str(e)
 
-def download_single_clip(url, target_path):
+def download_single_clip(task):
+    url, target_path, original_index = task
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         with requests.get(url, stream=True, timeout=45, headers=headers) as r:
@@ -215,9 +227,9 @@ def download_single_clip(url, target_path):
             with open(target_path, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=65536):
                     f.write(chunk)
-        return True
+        return True, target_path
     except Exception:
-        return False
+        return False, target_path
 
 def upload_to_vidara(server, video_path):
     filename = os.path.basename(video_path)
@@ -271,11 +283,11 @@ def main():
         print(f"[+] START PROCESSING ROW {idx}: {title}")
         print(f"========================================================")
 
-        mp4_urls, error_msg = scrape_links_with_unblocked_engine(url)
+        mp4_urls = scrape_links_with_unblocked_engine(url)[0]
         video_count = len(mp4_urls)
 
-        if error_msg or video_count == 0:
-            err = error_msg if error_msg else "Zero video links found (Page blocked or element path blank)."
+        if video_count == 0:
+            err = "Zero video links found (Page blocked or element path blank)."
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err]])
             print(f"[-] Skipped row {idx}: {err}")
             continue
@@ -283,38 +295,44 @@ def main():
         temp_dir = os.path.abspath(f"./temp_worker")
         os.makedirs(temp_dir, exist_ok=True)
         
+        # Build tasks capturing exact layout structure indexes discovered on original page
         download_tasks = []
-        for i, mp4_url in enumerate(sorted(mp4_urls), start=1):
+        for i, mp4_url in enumerate(mp4_urls):
             temp_clip_path = os.path.join(temp_dir, f"clip_{i:03d}.mp4")
-            download_tasks.append((mp4_url, temp_clip_path))
+            download_tasks.append((mp4_url, temp_clip_path, i))
 
-        print(f"[LOG] Starting concurrent stream extraction pipeline ({video_count} items)...")
-        downloaded_clips = []
+        print(f"[LOG] Launching thread workers using strict presentation sequence map ({video_count} items)...")
+        downloaded_clips = [None] * video_count
+        download_failed = False
         
         with ThreadPoolExecutor(max_workers=MAX_DOWNLOAD_WORKERS) as download_executor:
-            futures = {download_executor.submit(download_single_clip, u, p): p for u, p in download_tasks}
+            futures = {download_executor.submit(download_single_clip, task): task for task in download_tasks}
             for future in as_completed(futures):
-                clip_path = futures[future]
-                if future.result():
-                    downloaded_clips.append(clip_path)
-                    print(f"  [✓] Fragment downloaded successfully: {os.path.basename(clip_path)}")
+                task_details = futures[future]
+                original_pos = task_details[2]
+                success, clip_path = future.result()
+                if success:
+                    downloaded_clips[original_pos] = clip_path
+                    print(f"  [✓] Fragment placement position {original_pos+1} downloaded successfully.")
                 else:
-                    print(f"  [!] Target slice download failed: {clip_path}")
+                    print(f"  [!] Target slice sequence link location {original_pos+1} failed download stage.")
+                    download_failed = True
 
-        downloaded_clips.sort()
+        if download_failed or None in downloaded_clips:
+            merge_success = False
+            err_text = f"Download validation mismatch; tracking drops skipped during chunk extraction."
+        else:
+            print(f"[LOG] Stream parts downloaded. Transferring cleanly to the seamless merge layout layer...")
+            merge_success, merge_err = merge_large_video_batch(downloaded_clips, os.path.abspath(f"./temp_out.mp4"), temp_dir)
+            err_text = merge_err if merge_err else ""
 
         next_assign_num = max_num + 1
         clean_name = sanitize_filename(title)
         final_filename = f"{next_assign_num}. {clean_name}.mp4"
         final_output_file = os.path.abspath(f"./{final_filename}")
 
-        if len(downloaded_clips) == video_count and video_count > 0:
-            print(f"[LOG] Initiating standardization and processing for file assembly...")
-            merge_success, merge_err = merge_large_video_batch(downloaded_clips, final_output_file, temp_dir)
-            err_text = merge_err if merge_err else ""
-        else:
-            merge_success = False
-            err_text = f"Downloaded clips count mismatch ({len(downloaded_clips)}/{video_count})"
+        if merge_success and os.path.exists("./temp_out.mp4"):
+            shutil.move("./temp_out.mp4", final_output_file)
 
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
