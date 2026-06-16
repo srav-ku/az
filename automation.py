@@ -130,49 +130,75 @@ def scrape_links_with_unblocked_engine(actress_url):
 
     return list(set(mp4_links)), None
 
-def normal_merge_clips(clips_list, output_path):
+def has_audio_stream(file_path):
+    """Checks if a video file contains any valid audio tracks using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=codec_type", "-of", "json", file_path
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        data = json.loads(res.stdout)
+        return bool(data.get("streams"))
+    except Exception:
+        return True # Default assume true if ffprobe acts up
+
+def normal_merge_clips(clips_list, output_path, temp_dir):
     """
-    Combines mixed videos cleanly via an on-the-fly matrix. Low-res and vertical clips 
-    are placed inside a unified canvas naturally without distortion or losing quality.
+    Performs ultra-fast lossless video joining using FFmpeg's concat demuxer (-c copy).
+    Appends silent audio streams to clip fragments missing an audio track to prevent crashes.
     """
     if not clips_list:
         return False, "No clips provided for merging."
 
-    print(f"[LOG] Building dynamic canvas matrix for {len(clips_list)} mixed clips...")
+    print(f"[LOG] Verifying stream structures for {len(clips_list)} files...")
     
-    cmd = ["ffmpeg", "-y"]
-    for clip in clips_list:
-        cmd.extend(["-i", clip])
+    final_input_list = []
+    
+    # 1. Quickly make sure every file has an audio stream to prevent stream mapping crashes
+    for idx, clip in enumerate(clips_list):
+        if has_audio_stream(clip):
+            final_input_list.append(clip)
+        else:
+            print(f"  [!] Missing audio stream detected on fragment index {idx}. Fixing instantly...")
+            fixed_clip_path = os.path.join(temp_dir, f"fixed_audio_{idx}.mp4")
+            
+            # Generates a silent audio track and combines it with the video stream copy
+            cmd_fix = [
+                "ffmpeg", "-y", "-i", clip,
+                "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-c:v", "copy", "-c:a", "aac", "-shortest", "-loglevel", "error", fixed_clip_path
+            ]
+            try:
+                res = subprocess.run(cmd_fix, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if res.returncode == 0 and os.path.exists(fixed_clip_path):
+                    final_input_list.append(fixed_clip_path)
+                else:
+                    final_input_list.append(clip) # Fallback to original if fix errors out
+            except Exception:
+                final_input_list.append(clip)
 
-    filter_complex = ""
-    # 1. Take each clip and safely position it into a standard 1280x720 box
-    for idx in range(len(clips_list)):
-        filter_complex += (
-            f"[{idx}:v]scale=1280:720:force_original_aspect_ratio=decrease,"
-            f"pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1[v{idx}];"
-        )
+    # 2. Build the temporary playlist file text layout required by the concat demuxer
+    list_txt_path = os.path.join(temp_dir, "concat_playlist.txt")
+    with open(list_txt_path, "w", encoding="utf-8") as f:
+        for clip_path in final_input_list:
+            # Escape single quotes in filenames for the FFmpeg file tracker
+            escaped_path = os.path.abspath(clip_path).replace("'", "'\\''")
+            f.write(f"file '{escaped_path}'\n")
+
+    print("[LOG] Executing lightning-fast lossless stream merge pass...")
     
-    # 2. Line up the prepared video and audio channels back-to-back
-    for idx in range(len(clips_list)):
-        filter_complex += f"[v{idx}][{idx}:a]"
-        
-    filter_complex += f"concat=n={len(clips_list)}:v=1:a=1[v][a]"
-    
-    # 3. Export using CRF 16 (Visually Lossless Quality Control)
-    cmd.extend([
-        "-filter_complex", filter_complex,
-        "-map", "[v]", "-map", "[a]",
-        "-c:v", "libx264", "-preset", "faster", "-crf", "16",
-        "-c:a", "aac", "-b:a", "192k",
-        "-loglevel", "error", output_path
-    ])
+    # 3. Perform the fast concat block stitch copy operation
+    cmd_merge = [
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
+        "-c", "copy", "-loglevel", "error", output_path
+    ]
 
     try:
-        print("[LOG] Stitching videos via high-fidelity rendering pipeline...")
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        result = subprocess.run(cmd_merge, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0 and os.path.exists(output_path):
             return True, None
-        return False, f"FFmpeg native engine stitching failed: {result.stderr}"
+        return False, f"Lossless concat engine failed: {result.stderr}"
     except Exception as e:
         return False, str(e)
 
@@ -278,7 +304,7 @@ def main():
         final_output_file = os.path.abspath(f"./{final_filename}")
 
         if len(downloaded_clips) == video_count and video_count > 0:
-            merge_success, merge_err = normal_merge_clips(downloaded_clips, final_output_file)
+            merge_success, merge_err = normal_merge_clips(downloaded_clips, final_output_file, temp_dir)
             err_text = merge_err if merge_err else ""
         else:
             merge_success = False
