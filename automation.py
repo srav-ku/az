@@ -130,65 +130,70 @@ def scrape_links_with_unblocked_engine(actress_url):
 
     return list(set(mp4_links)), None
 
-def has_audio_stream(file_path):
-    """Checks if a video file contains any valid audio tracks using ffprobe."""
+def check_audio_presence(file_path):
+    """Uses ffprobe to verify if the file has an active audio channel."""
     cmd = [
         "ffprobe", "-v", "error", "-select_streams", "a",
         "-show_entries", "stream=codec_type", "-of", "json", file_path
     ]
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        data = json.loads(res.stdout)
-        return bool(data.get("streams"))
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        data = json.loads(result.stdout)
+        return len(data.get("streams", [])) > 0
     except Exception:
-        return True # Default assume true if ffprobe acts up
+        return False
 
-def normal_merge_clips(clips_list, output_path, temp_dir):
-    """
-    Performs ultra-fast lossless video joining using FFmpeg's concat demuxer (-c copy).
-    Appends silent audio streams to clip fragments missing an audio track to prevent crashes.
-    """
+def merge_large_video_batch(clips_list, output_path, temp_dir):
     if not clips_list:
         return False, "No clips provided for merging."
 
-    print(f"[LOG] Verifying stream structures for {len(clips_list)} files...")
+    # Forces an optimized standard widescreen aspect ratio to avoid shrinking bugs
+    target_w, target_h = 1280, 720
+    print(f"[LOG] Target Frame Dimensions Configured: {target_w}x{target_h}")
+
+    standardized_clips = []
     
-    final_input_list = []
-    
-    # 1. Quickly make sure every file has an audio stream to prevent stream mapping crashes
     for idx, clip in enumerate(clips_list):
-        if has_audio_stream(clip):
-            final_input_list.append(clip)
+        norm_output = os.path.join(temp_dir, f"norm_{idx}.mp4")
+        has_audio = check_audio_presence(clip)
+        print(f"  [-] Standardizing video/audio layout ({idx+1}/{len(clips_list)}) | Has Audio: {has_audio}")
+
+        if has_audio:
+            # Clip already contains native audio; match video size to canvas safely
+            cmd_norm = [
+                "ffmpeg", "-y", "-i", clip,
+                "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
+                "-c:v", "libx264", "-crf", "16", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+                "-loglevel", "error", norm_output
+            ]
         else:
-            print(f"  [!] Missing audio stream detected on fragment index {idx}. Fixing instantly...")
-            fixed_clip_path = os.path.join(temp_dir, f"fixed_audio_{idx}.mp4")
-            
-            # Generates a silent audio track and combines it with the video stream copy
-            cmd_fix = [
+            # Clip is silent; synthesize a matching dummy silent audio stream track so stitching doesn't break
+            cmd_norm = [
                 "ffmpeg", "-y", "-i", clip,
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-c:v", "copy", "-c:a", "aac", "-shortest", "-loglevel", "error", fixed_clip_path
+                "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
+                "-c:v", "libx264", "-crf", "16", "-preset", "ultrafast",
+                "-c:a", "aac", "-b:a", "128k", "-ac", "2", "-shortest",
+                "-loglevel", "error", norm_output
             ]
-            try:
-                res = subprocess.run(cmd_fix, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if res.returncode == 0 and os.path.exists(fixed_clip_path):
-                    final_input_list.append(fixed_clip_path)
-                else:
-                    final_input_list.append(clip) # Fallback to original if fix errors out
-            except Exception:
-                final_input_list.append(clip)
 
-    # 2. Build the temporary playlist file text layout required by the concat demuxer
-    list_txt_path = os.path.join(temp_dir, "concat_playlist.txt")
+        try:
+            res = subprocess.run(cmd_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode == 0 and os.path.exists(norm_output):
+                standardized_clips.append(norm_output)
+            else:
+                return False, f"Clip processing failed at index {idx} with error: {res.stderr.decode()}"
+        except Exception as e:
+            return False, f"Exception during normalization of clip {idx}: {str(e)}"
+
+    # Generate the text index file mapping for the demuxer pipeline
+    list_txt_path = os.path.join(temp_dir, "batch_list.txt")
     with open(list_txt_path, "w", encoding="utf-8") as f:
-        for clip_path in final_input_list:
-            # Escape single quotes in filenames for the FFmpeg file tracker
-            escaped_path = os.path.abspath(clip_path).replace("'", "'\\''")
-            f.write(f"file '{escaped_path}'\n")
+        for clip_path in standardized_clips:
+            f.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-    print("[LOG] Executing lightning-fast lossless stream merge pass...")
-    
-    # 3. Perform the fast concat block stitch copy operation
+    print(f"[LOG] Merging clean tracks into final destination file: {output_path}")
     cmd_merge = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
         "-c", "copy", "-loglevel", "error", output_path
@@ -198,7 +203,7 @@ def normal_merge_clips(clips_list, output_path, temp_dir):
         result = subprocess.run(cmd_merge, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0 and os.path.exists(output_path):
             return True, None
-        return False, f"Lossless concat engine failed: {result.stderr}"
+        return False, f"Stitching backend failure: {result.stderr}"
     except Exception as e:
         return False, str(e)
 
@@ -304,7 +309,8 @@ def main():
         final_output_file = os.path.abspath(f"./{final_filename}")
 
         if len(downloaded_clips) == video_count and video_count > 0:
-            merge_success, merge_err = normal_merge_clips(downloaded_clips, final_output_file, temp_dir)
+            print(f"[LOG] Initiating standardization and processing for file assembly...")
+            merge_success, merge_err = merge_large_video_batch(downloaded_clips, final_output_file, temp_dir)
             err_text = merge_err if merge_err else ""
         else:
             merge_success = False
