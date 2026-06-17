@@ -44,7 +44,7 @@ def get_vidara_server():
     return None
 
 def scrape_links_with_unblocked_engine(actress_url):
-    """Uses optimized Playwright flags to extract links in the exact structural order they appear on the page layout."""
+    """Extracts links strictly in the original sequence they appear on the page layout."""
     video_pages = []
     mp4_links = []
 
@@ -74,7 +74,6 @@ def scrape_links_with_unblocked_engine(actress_url):
             page.wait_for_timeout(3000)
             
             main_html = page.content()
-            print(f"[LOG] Successfully extracted HTML content size: {len(main_html)} characters.")
             soup = BeautifulSoup(main_html, "html.parser")
         except Exception as e:
             print(f"[ERROR] Playwright failed to navigate or extract hub page: {str(e)}")
@@ -93,15 +92,15 @@ def scrape_links_with_unblocked_engine(actress_url):
                     video_pages.append(path)
 
         if not video_pages:
-            print("[LOG] Warning: Selectors parsed successfully, but found 0 video subpages.")
+            print("[LOG] Warning: Found 0 video subpages.")
             browser.close()
             return [], None
 
         print(f"[LOG] Found {len(video_pages)} video subpages. Processing streams in chronological order...")
 
+        # Strict extraction loop mapping exactly to video_pages layout array index order
         for idx, video_page in enumerate(video_pages, start=1):
             try:
-                print(f"  -> [{idx}/{len(video_pages)}] Parsing subpage: {video_page}")
                 page.goto(video_page, wait_until="commit", timeout=25000)
                 page.wait_for_timeout(1000)
                 
@@ -119,15 +118,11 @@ def scrape_links_with_unblocked_engine(actress_url):
                             print(f"     [✓] Discovered MP4 resource link: {href}")
                         found_on_page = True
                         break
-                if not found_on_page:
-                    print("     [!] No direct .mp4 reference link detected on this subpage layout.")
             except Exception as sub_e:
                 print(f"     [!] Failed to extract details from subpage due to exception: {sub_e}")
                 continue
 
         browser.close()
-        print(f"[LOG] Playwright engine shut down. Unique video links parsed in exact order: {len(mp4_links)}")
-
     return mp4_links, None
 
 def check_audio_presence(file_path):
@@ -143,52 +138,45 @@ def check_audio_presence(file_path):
     except Exception:
         return False
 
-def merge_large_video_batch(ordered_clips, output_path, temp_dir):
-    if not ordered_clips:
+def merge_large_video_batch(clips_list, output_path, temp_dir):
+    if not clips_list:
         return False, "No clips provided for merging."
 
-    final_input_list = []
+    final_inputs = []
     
-    # Process sequential clips loop based on extraction discovery index
-    for idx, clip in enumerate(ordered_clips):
+    # Check audio channels and keep stream parameters completely native
+    for idx, clip in enumerate(clips_list):
         has_audio = check_audio_presence(clip)
-        
         if has_audio:
-            # Native audio present. Keep stream completely untouched to preserve original quality
-            final_input_list.append(clip)
-            print(f"  [-] Verified clip alignment ({idx+1}/{len(ordered_clips)}) | Kept Original Tracks Lossless")
+            final_inputs.append(clip)
         else:
-            # Missing audio track detected. Inject silent container instantly without quality loss
-            print(f"  [!] Missing audio stream detected on fragment index {idx+1}. Inserting silent sync track...")
-            fixed_clip_path = os.path.join(temp_dir, f"fixed_audio_{idx:03d}.mp4")
-            
-            cmd_fix = [
+            # Generate silent audio track that mirrors the original video container directly without transcode adjustments
+            silent_track_clip = os.path.join(temp_dir, f"silent_{idx:03d}.mp4")
+            cmd_silent = [
                 "ffmpeg", "-y", "-i", clip,
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-c:v", "copy", "-c:a", "aac", "-shortest", "-loglevel", "error", fixed_clip_path
+                "-c:v", "copy", "-c:a", "aac", "-shortest", "-loglevel", "error", silent_track_clip
             ]
             try:
-                res = subprocess.run(cmd_fix, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if res.returncode == 0 and os.path.exists(fixed_clip_path):
-                    final_input_list.append(fixed_clip_path)
+                res = subprocess.run(cmd_silent, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                if res.returncode == 0 and os.path.exists(silent_track_clip):
+                    final_inputs.append(silent_track_clip)
                 else:
-                    final_input_list.append(clip)
+                    final_inputs.append(clip)
             except Exception:
-                final_input_list.append(clip)
+                final_inputs.append(clip)
 
-    # Generate the text tracking playlist mapping for the lossless demuxer engine
     list_txt_path = os.path.join(temp_dir, "batch_list.txt")
     with open(list_txt_path, "w", encoding="utf-8") as f:
-        for clip_path in final_input_list:
-            escaped_path = os.path.abspath(clip_path).replace("'", "'\\''")
-            f.write(f"file '{escaped_path}'\n")
+        for clip_path in final_inputs:
+            f.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-    print(f"[LOG] Executing lightning-fast lossless stream merge copy pass to: {output_path}")
+    print(f"[LOG] Direct native stream-copy concat pass to final file target: {output_path}")
     
-    # Complete copy pass without conversion layers, preserving original dimensions and frame properties
+    # Performs a stream copy concatenation pass. No re-encoding, zero resolution shift, absolute 1:1 original quality.
     cmd_merge = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
-        "-c", "copy", "-loglevel", "error", output_path
+        "-c", "copy", "-async", "1", "-loglevel", "error", output_path
     ]
 
     try:
@@ -233,7 +221,6 @@ def upload_to_vidara(server, video_path):
 def main():
     print("[LOG] Script initiated. Grabbing target Google Sheet records...")
     records = sheet.get_all_records()
-    print(f"[LOG] Successfully pulled {len(records)} records from spreadsheet.")
     
     max_num = 0
     for r in records:
@@ -243,11 +230,10 @@ def main():
                 max_num = val
         except ValueError:
             continue
-    print(f"[LOG] Current highest video index number sequence located: {max_num}")
 
     upload_server = get_vidara_server()
     if not upload_server:
-        print("[ERROR] Could not acquire active Vidara upload target. Exiting script.")
+        print("[ERROR] Could not acquire active Vidara upload target.")
         return
 
     for idx, row in enumerate(records, start=2):
@@ -255,9 +241,7 @@ def main():
         title = str(row.get("Title", "")).strip()
         url = str(row.get("Link", "")).strip()
 
-        if status in ["success", "failed"]:
-            continue
-        if not title or not url:
+        if status in ["success", "failed"] or not title or not url:
             continue
 
         print(f"\n========================================================")
@@ -268,21 +252,20 @@ def main():
         video_count = len(mp4_urls)
 
         if video_count == 0:
-            err = "Zero video links found (Page blocked or element path blank)."
+            err = "Zero video links found."
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err]])
-            print(f"[-] Skipped row {idx}: {err}")
             continue
 
         temp_dir = os.path.abspath(f"./temp_worker")
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Build task mapping preserving structural discovery order found on webpage layout
+        # Mapping tasks to match the web layout extraction index order perfectly
         download_tasks = []
         for i, mp4_url in enumerate(mp4_urls):
             temp_clip_path = os.path.join(temp_dir, f"clip_{i:03d}.mp4")
             download_tasks.append((mp4_url, temp_clip_path, i))
 
-        print(f"[LOG] Launching sequential download stages ({video_count} items)...")
+        print(f"[LOG] Commencing concurrent sequence matching downloads...")
         downloaded_clips = [None] * video_count
         download_failed = False
         
@@ -294,16 +277,17 @@ def main():
                 success, clip_path = future.result()
                 if success:
                     downloaded_clips[original_pos] = clip_path
-                    print(f"  [✓] Fragment placement position {original_pos+1} downloaded successfully.")
+                    print(f"  [✓] Fragment {original_pos+1} downloaded successfully.")
                 else:
-                    print(f"  [!] Target slice sequence link location {original_pos+1} failed download stage.")
+                    print(f"  [!] Target slice {original_pos+1} download failed.")
                     download_failed = True
 
         if download_failed or None in downloaded_clips:
             merge_success = False
-            err_text = f"Download validation mismatch; tracking drops skipped during chunk extraction."
+            err_text = "Download verification mismatch or incomplete segments."
         else:
-            print(f"[LOG] Stream parts ready. Transferring to 1:1 lossless concatenation loop...")
+            print(f"[LOG] Initiating native copy pass merge stitching routine...")
+            # Send list in correct order directly down to processing layer
             merge_success, merge_err = merge_large_video_batch(downloaded_clips, os.path.abspath(f"./temp_out.mp4"), temp_dir)
             err_text = merge_err if merge_err else ""
 
@@ -322,7 +306,6 @@ def main():
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err_text]])
             if os.path.exists(final_output_file):
                 os.remove(final_output_file)
-            print(f"[-] Row {idx} processing failed during compilation: {err_text}")
             continue
 
         print(f"[LOG] Dispatching completed block artifact payload out to Vidara host...")
@@ -333,11 +316,9 @@ def main():
 
         if up_ok:
             sheet.update(range_name=f'C{idx}:F{idx}', values=[[next_assign_num, video_count, "success", ""]])
-            print(f"[✓] Row {idx} fully verified and recorded in spreadsheet context! Sequence Index: {next_assign_num}")
             max_num = next_assign_num
         else:
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", f"Upload error: {up_err}"]])
-            print(f"[ERROR] Row {idx} Upload Failed.")
 
 if __name__ == "__main__":
     main()
