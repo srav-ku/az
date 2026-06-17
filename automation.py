@@ -44,7 +44,7 @@ def get_vidara_server():
     return None
 
 def scrape_links_with_unblocked_engine(actress_url):
-    """Extracts links strictly in the original sequence they appear on the page layout."""
+    """Uses optimized Playwright flags to bypass cloud hangs and extracts links in strict presentation order."""
     video_pages = []
     mp4_links = []
 
@@ -74,6 +74,7 @@ def scrape_links_with_unblocked_engine(actress_url):
             page.wait_for_timeout(3000)
             
             main_html = page.content()
+            print(f"[LOG] Successfully extracted HTML content size: {len(main_html)} characters.")
             soup = BeautifulSoup(main_html, "html.parser")
         except Exception as e:
             print(f"[ERROR] Playwright failed to navigate or extract hub page: {str(e)}")
@@ -92,15 +93,16 @@ def scrape_links_with_unblocked_engine(actress_url):
                     video_pages.append(path)
 
         if not video_pages:
-            print("[LOG] Warning: Found 0 video subpages.")
+            print("[LOG] Warning: Selectors parsed successfully, but found 0 video subpages.")
             browser.close()
             return [], None
 
         print(f"[LOG] Found {len(video_pages)} video subpages. Processing streams in chronological order...")
 
-        # Strict extraction loop mapping exactly to video_pages layout array index order
+        # Maintain exact layout sequence order as found on the website layout
         for idx, video_page in enumerate(video_pages, start=1):
             try:
+                print(f"  -> [{idx}/{len(video_pages)}] Parsing subpage: {video_page}")
                 page.goto(video_page, wait_until="commit", timeout=25000)
                 page.wait_for_timeout(1000)
                 
@@ -118,11 +120,15 @@ def scrape_links_with_unblocked_engine(actress_url):
                             print(f"     [✓] Discovered MP4 resource link: {href}")
                         found_on_page = True
                         break
+                if not found_on_page:
+                    print("     [!] No direct .mp4 reference link detected on this subpage layout.")
             except Exception as sub_e:
                 print(f"     [!] Failed to extract details from subpage due to exception: {sub_e}")
                 continue
 
         browser.close()
+        print(f"[LOG] Playwright engine shut down. Unique video links parsed: {len(mp4_links)}")
+
     return mp4_links, None
 
 def check_audio_presence(file_path):
@@ -142,41 +148,60 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
     if not clips_list:
         return False, "No clips provided for merging."
 
-    final_inputs = []
+    # Force a solid 1080p master frame to protect high-res video assets from dropping details
+    target_w, target_h = 1920, 1080
+    print(f"[LOG] Master Target Frame Dimensions Set: {target_w}x{target_h} HD Canvas")
+
+    standardized_clips = []
     
-    # Check audio channels and keep stream parameters completely native
     for idx, clip in enumerate(clips_list):
+        norm_output = os.path.join(temp_dir, f"norm_{idx:03d}.mp4")
         has_audio = check_audio_presence(clip)
+        print(f"  [-] Locking tracks & layout sync ({idx+1}/{len(clips_list)}) | Audio Present: {has_audio}")
+
+        # Standardizing video canvas size while enforcing constant frame rate + real-time asynchronous resampling for absolute zero lag/drift
         if has_audio:
-            final_inputs.append(clip)
+            cmd_norm = [
+                "ffmpeg", "-y", "-i", clip,
+                "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
+                "-af", "aresample=async=1",
+                "-c:v", "libx264", "-crf", "12", "-preset", "superfast",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
+                "-vsync", "cfr", "-loglevel", "error", norm_output
+            ]
         else:
-            # Generate silent audio track that mirrors the original video container directly without transcode adjustments
-            silent_track_clip = os.path.join(temp_dir, f"silent_{idx:03d}.mp4")
-            cmd_silent = [
+            # Inject silent track matching the exact audio profile settings seamlessly
+            cmd_norm = [
                 "ffmpeg", "-y", "-i", clip,
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-                "-c:v", "copy", "-c:a", "aac", "-shortest", "-loglevel", "error", silent_track_clip
+                "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
+                "-af", "aresample=async=1",
+                "-c:v", "libx264", "-crf", "12", "-preset", "superfast",
+                "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
+                "-shortest", "-vsync", "cfr", "-loglevel", "error", norm_output
             ]
-            try:
-                res = subprocess.run(cmd_silent, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                if res.returncode == 0 and os.path.exists(silent_track_clip):
-                    final_inputs.append(silent_track_clip)
-                else:
-                    final_inputs.append(clip)
-            except Exception:
-                final_inputs.append(clip)
+
+        try:
+            res = subprocess.run(cmd_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if res.returncode == 0 and os.path.exists(norm_output):
+                standardized_clips.append(norm_output)
+            else:
+                return False, f"Clip processing failed at index {idx} with error: {res.stderr.decode()}"
+        except Exception as e:
+            return False, f"Exception during normalization of clip {idx}: {str(e)}"
+
+    # Ensure files are passed to the demuxer playlist in exact chronological array index string ordering
+    standardized_clips.sort()
 
     list_txt_path = os.path.join(temp_dir, "batch_list.txt")
     with open(list_txt_path, "w", encoding="utf-8") as f:
-        for clip_path in final_inputs:
+        for clip_path in standardized_clips:
             f.write(f"file '{os.path.abspath(clip_path)}'\n")
 
-    print(f"[LOG] Direct native stream-copy concat pass to final file target: {output_path}")
-    
-    # Performs a stream copy concatenation pass. No re-encoding, zero resolution shift, absolute 1:1 original quality.
+    print(f"[LOG] Merging aligned tracks into final presentation destination file: {output_path}")
     cmd_merge = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
-        "-c", "copy", "-async", "1", "-loglevel", "error", output_path
+        "-c", "copy", "-vsync", "cfr", "-loglevel", "error", output_path
     ]
 
     try:
@@ -221,6 +246,7 @@ def upload_to_vidara(server, video_path):
 def main():
     print("[LOG] Script initiated. Grabbing target Google Sheet records...")
     records = sheet.get_all_records()
+    print(f"[LOG] Successfully pulled {len(records)} records from spreadsheet.")
     
     max_num = 0
     for r in records:
@@ -230,10 +256,11 @@ def main():
                 max_num = val
         except ValueError:
             continue
+    print(f"[LOG] Current highest video index number sequence located: {max_num}")
 
     upload_server = get_vidara_server()
     if not upload_server:
-        print("[ERROR] Could not acquire active Vidara upload target.")
+        print("[ERROR] Could not acquire active Vidara upload target. Exiting script.")
         return
 
     for idx, row in enumerate(records, start=2):
@@ -241,7 +268,9 @@ def main():
         title = str(row.get("Title", "")).strip()
         url = str(row.get("Link", "")).strip()
 
-        if status in ["success", "failed"] or not title or not url:
+        if status in ["success", "failed"]:
+            continue
+        if not title or not url:
             continue
 
         print(f"\n========================================================")
@@ -252,20 +281,21 @@ def main():
         video_count = len(mp4_urls)
 
         if video_count == 0:
-            err = "Zero video links found."
+            err = "Zero video links found (Page blocked or element path blank)."
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err]])
+            print(f"[-] Skipped row {idx}: {err}")
             continue
 
         temp_dir = os.path.abspath(f"./temp_worker")
         os.makedirs(temp_dir, exist_ok=True)
         
-        # Mapping tasks to match the web layout extraction index order perfectly
+        # Build tasks holding the exact sequential index order found directly on the page layout
         download_tasks = []
         for i, mp4_url in enumerate(mp4_urls):
             temp_clip_path = os.path.join(temp_dir, f"clip_{i:03d}.mp4")
             download_tasks.append((mp4_url, temp_clip_path, i))
 
-        print(f"[LOG] Commencing concurrent sequence matching downloads...")
+        print(f"[LOG] Starting concurrent ordered stream extraction pipeline ({video_count} items)...")
         downloaded_clips = [None] * video_count
         download_failed = False
         
@@ -284,10 +314,9 @@ def main():
 
         if download_failed or None in downloaded_clips:
             merge_success = False
-            err_text = "Download verification mismatch or incomplete segments."
+            err_text = f"Download verification missing or incomplete drops encountered."
         else:
-            print(f"[LOG] Initiating native copy pass merge stitching routine...")
-            # Send list in correct order directly down to processing layer
+            print(f"[LOG] Initiating alignment and processing for final assembly...")
             merge_success, merge_err = merge_large_video_batch(downloaded_clips, os.path.abspath(f"./temp_out.mp4"), temp_dir)
             err_text = merge_err if merge_err else ""
 
@@ -306,6 +335,7 @@ def main():
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", err_text]])
             if os.path.exists(final_output_file):
                 os.remove(final_output_file)
+            print(f"[-] Row {idx} processing failed during compilation: {err_text}")
             continue
 
         print(f"[LOG] Dispatching completed block artifact payload out to Vidara host...")
@@ -316,9 +346,11 @@ def main():
 
         if up_ok:
             sheet.update(range_name=f'C{idx}:F{idx}', values=[[next_assign_num, video_count, "success", ""]])
+            print(f"[✓] Row {idx} fully verified and recorded in spreadsheet context! Sequence Index: {next_assign_num}")
             max_num = next_assign_num
         else:
             sheet.update(range_name=f'D{idx}:F{idx}', values=[[video_count, "failed", f"Upload error: {up_err}"]])
+            print(f"[ERROR] Row {idx} Upload Failed.")
 
 if __name__ == "__main__":
     main()
