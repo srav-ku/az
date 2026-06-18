@@ -155,19 +155,24 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
     standardized_clips = []
     
     for idx, clip in enumerate(clips_list):
+        if not clip or not os.path.exists(clip):
+            continue
+            
         norm_output = os.path.join(temp_dir, f"norm_{idx:03d}.mp4")
         has_audio = check_audio_presence(clip)
         print(f"  [-] Locking tracks & layout sync ({idx+1}/{len(clips_list)}) | Audio Present: {has_audio}")
 
-        # Standardizing video canvas size while enforcing constant frame rate + real-time asynchronous resampling for absolute zero lag/drift
+        # Fix 1: CRF 23 instead of 12 (Massive disk space saver)
+        # Fix 2: -fps_mode cfr instead of -vsync cfr (Prevents lag/stutter in modern FFmpeg)
+        # Fix 3: -threads 2 prevents the runner from locking up
         if has_audio:
             cmd_norm = [
                 "ffmpeg", "-y", "-i", clip,
                 "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-                "-af", "aresample=async=1",
-                "-c:v", "libx264", "-crf", "12", "-preset", "superfast",
+                "-af", "aresample=async=1000", # Better audio stretch buffering to prevent desync
+                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-                "-vsync", "cfr", "-loglevel", "error", norm_output
+                "-fps_mode", "cfr", "-threads", "2", "-loglevel", "error", norm_output
             ]
         else:
             # Inject silent track matching the exact audio profile settings seamlessly
@@ -175,22 +180,26 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
                 "ffmpeg", "-y", "-i", clip,
                 "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
                 "-vf", f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,fps=30,setsar=1",
-                "-af", "aresample=async=1",
-                "-c:v", "libx264", "-crf", "12", "-preset", "superfast",
+                "-af", "aresample=async=1000",
+                "-c:v", "libx264", "-crf", "23", "-preset", "fast",
                 "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
-                "-shortest", "-vsync", "cfr", "-loglevel", "error", norm_output
+                "-shortest", "-fps_mode", "cfr", "-threads", "2", "-loglevel", "error", norm_output
             ]
 
         try:
             res = subprocess.run(cmd_norm, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if res.returncode == 0 and os.path.exists(norm_output):
                 standardized_clips.append(norm_output)
+                # CRITICAL FIX: Delete the raw downloaded clip to prevent GitHub Actions disk crash
+                try:
+                    os.remove(clip)
+                except Exception:
+                    pass
             else:
                 return False, f"Clip processing failed at index {idx} with error: {res.stderr.decode()}"
         except Exception as e:
             return False, f"Exception during normalization of clip {idx}: {str(e)}"
 
-    # Ensure files are passed to the demuxer playlist in exact chronological array index string ordering
     standardized_clips.sort()
 
     list_txt_path = os.path.join(temp_dir, "batch_list.txt")
@@ -201,7 +210,7 @@ def merge_large_video_batch(clips_list, output_path, temp_dir):
     print(f"[LOG] Merging aligned tracks into final presentation destination file: {output_path}")
     cmd_merge = [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_txt_path,
-        "-c", "copy", "-vsync", "cfr", "-loglevel", "error", output_path
+        "-c", "copy", "-loglevel", "error", output_path
     ]
 
     try:
